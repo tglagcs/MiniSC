@@ -1,0 +1,11 @@
+__pycache__/
+.claude/
+
+config.json
+likes_cache.json
+CLAUDE.md
+
+# PyInstaller
+build/
+dist/
+*.spec

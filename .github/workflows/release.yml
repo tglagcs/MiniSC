@@ -1,0 +1,50 @@
+name: Build & Release
+
+# Сборка portable exe на раннере GitHub:
+#  - пуш тега вида v1.0 → собрать и приложить exe к релизу этого тега;
+#  - ручной запуск (workflow_dispatch) → просто собрать, exe будет в артефактах.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # создание релиза и загрузка файлов в него
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build exe
+        # av (PyAV, тянет FFmpeg) и pygame-ce покрыты pyinstaller-hooks-contrib —
+        # спец-хуки не нужны, как и в MiniYaMu.
+        run: pyinstaller --noconfirm --onefile --noconsole --name MiniSC --icon icon.ico main.py
+
+      - name: Smoke check
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist/MiniSC.exe)) { throw "dist/MiniSC.exe not found" }
+          "exe size: {0:N1} MB" -f ((Get-Item dist/MiniSC.exe).Length / 1MB)
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiniSC
+          path: dist/MiniSC.exe
+
+      - name: Attach exe to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/MiniSC.exe
+          generate_release_notes: true

@@ -9,7 +9,7 @@
 
 **Мини-плеер персональной волны SoundCloud, живущий в системном трее Windows.**
 
-Тот же интерфейс и хоткеи, что у [MiniYaMu](../MiniYaMu) — только вместо «Моей
+Тот же интерфейс и хоткеи, что у [MiniYaMu](https://github.com/tglagcs/MiniYaMu) — только вместо «Моей
 волны» Яндекс.Музыки играет бесконечная персональная лента SoundCloud.
 
 <table>
@@ -26,7 +26,7 @@
   <tr>
     <td colspan="2" align="center">
       <img src="assets/auth.png" alt="Окно авторизации"><br>
-      <sub>Авторизация: токен подставляется из Firefox сам</sub>
+      <sub>Авторизация: токен сам подставляется из Firefox</sub>
     </td>
   </tr>
 </table>

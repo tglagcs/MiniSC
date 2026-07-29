@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def _data_dir() -> Path:
-    """Где хранить config.json/likes_cache.json.
+    """Где хранить config.json.
 
     Из исходников — корень проекта (удобно для разработки). Из собранного
     exe (PyInstaller ставит sys.frozen) — %APPDATA%/MiniSC: рядом с exe
@@ -21,9 +21,6 @@ def _data_dir() -> Path:
 
 
 CONFIG_PATH = _data_dir() / "config.json"
-# Кэш лайкнутого — отдельно от config.json: он объёмнее (сотни id),
-# перезаписывается целиком и его потеря безобидна (просто перекачаем список).
-LIKES_CACHE_PATH = _data_dir() / "likes_cache.json"
 
 DEFAULT_VOLUME = 1.0
 DEFAULT_SPEED = 1.0
@@ -154,27 +151,38 @@ def save_blocked_ids(ids) -> None:
     _write_config(data)
 
 
-def get_likes_cache() -> dict:
-    """Кэш списка лайков: `{"ids": [...], "fetched_at": <unix ts>}`.
+def get_local_likes() -> set:
+    """Локальные лайки: id треков, помеченных ❤ в самом MiniSC.
 
-    У SoundCloud нет ревизии списка (как у Яндекса), поэтому сверка не
-    «дешёвый вопрос об изменениях», а обычная перекачка id в фоне при старте —
-    кэш нужен, чтобы ❤ в меню было верным сразу, не дожидаясь сети.
-    """
-    if not LIKES_CACHE_PATH.exists():
-        return {}
-    try:
-        data = json.loads(LIKES_CACHE_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (json.JSONDecodeError, OSError):
-        return {}
+    Лайки хранятся локально, а не в аккаунте SoundCloud: его write-эндпоинт
+    лайков закрыт антиботом DataDome (см. sc_api/wave.py — поставить лайк из
+    скрипта нельзя, проверено). Поэтому ❤ работает как локальная отметка,
+    симметрично «дизлайку» (`blocked`)."""
+    raw = _read_config().get("local_likes", [])
+    if not isinstance(raw, list):
+        return set()
+    return {str(i) for i in raw}
 
 
-def save_likes_cache(cache: dict) -> None:
-    try:
-        LIKES_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-    except OSError:
-        pass  # кэш — необязательная оптимизация, без него просто медленнее старт
+def save_local_likes(ids) -> None:
+    data = _read_config()
+    data["local_likes"] = sorted(str(i) for i in ids)
+    _write_config(data)
+
+
+def get_likes_imported() -> bool:
+    """Импортировали ли уже серверные SoundCloud-лайки в локальные ❤.
+
+    Разовый импорт при первом запуске: чтобы ❤ сразу отражал реальную
+    библиотеку, но при этом снятые пользователем лайки не «воскресали»
+    повторным импортом на следующем старте."""
+    return bool(_read_config().get("likes_imported", False))
+
+
+def set_likes_imported() -> None:
+    data = _read_config()
+    data["likes_imported"] = True
+    _write_config(data)
 
 
 def _normalize_hotkey(entry: dict, default: dict) -> dict:

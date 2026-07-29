@@ -10,12 +10,14 @@ import pygame
 from . import pcm
 from .config import (
     get_blocked_ids,
-    get_likes_cache,
+    get_likes_imported,
+    get_local_likes,
     get_max_track_seconds,
     get_speed,
     save_blocked_ids,
-    save_likes_cache,
+    save_local_likes,
     save_speed,
+    set_likes_imported,
 )
 from .sc_api import SoundCloudClient, SoundCloudError, Track, shuffled
 
@@ -43,7 +45,9 @@ ARTIST_COOLDOWN = 5       # не ставить артиста, если он с
 ARTIST_WINDOW = 30        # окно сессии, в котором действует лимит частоты
 MAX_PLAYS_PER_WINDOW = 2  # ...не чаще стольких раз одного артиста в этом окне
 SELECTION_MIX = 12        # сколько треков персональных подборок подмешивать в добор
-LIKE_MIX = 4              # сколько лайков подмешивать прямо в пул добора
+# Лайки — только СЕМЯ для поиска похожего (SEED_LIKES), сами лайкнутые треки в
+# волну напрямую НЕ подмешиваются: иначе она переигрывает уже знакомое, и с
+# импортом лайков в ❤ это давало бы «Убрать лайк» на почти каждом треке.
 
 TrackChangeCallback = Callable[[Optional[Track]], None]
 
@@ -74,13 +78,13 @@ class WavePlayer:
         self._channel = pygame.mixer.Channel(0)
 
         self._queue: List[Track] = []
-        self._liked_ids: set = set()
+        self._liked_ids: set = get_local_likes()
         self._blocked_ids: set = get_blocked_ids()
         self._seen_ids: set = set()
         self._seeds: List[Tuple[str, str]] = []          # (track_id, artist)
         self._recent_artists: deque = deque(maxlen=ARTIST_WINDOW)
         self._selection_pool: List[Track] = []           # кэш подборок, чтобы подмешивать дёшево
-        self._like_pool: List[Track] = []                # кэш лайков — разнообразный сид/подмешка
+        self._like_pool: List[Track] = []                # кэш лайков — источник разнообразных СЕМЯН
         self._like_pool_loaded = False
         self._played: List[Track] = []
         self._position = -1
@@ -107,7 +111,7 @@ class WavePlayer:
                 return
             self._running = True
 
-        threading.Thread(target=self._load_likes, daemon=True).start()
+        threading.Thread(target=self._import_sc_likes_once, daemon=True).start()
         self._fetch_more()
         self._advance()
 
@@ -188,11 +192,13 @@ class WavePlayer:
             self.toggle_play_pause()
 
     def toggle_like(self) -> Optional[bool]:
-        """Ставит лайк, а если он уже стоит — снимает.
+        """Ставит/снимает ❤. Лайк ЛОКАЛЬНЫЙ — в аккаунт SoundCloud не уходит.
 
-        Возвращает новое состояние (True = лайк поставлен) сразу, не дожидаясь
-        сети: список лайкнутого ведётся локально (загружается при старте),
-        сам запрос уходит в фоновом потоке.
+        Почему не на сервер: write-эндпоинт лайков SoundCloud закрыт антиботом
+        DataDome — PUT `users/:id/track_likes/:id` отвечает 403 с капчей при
+        любых заголовках/куках/TLS-отпечатке (проверено). Поэтому ❤ живёт
+        локально в config.json (`local_likes`), симметрично «дизлайку»
+        (`blocked`). Возвращает новое состояние (True = лайк поставлен).
         """
         track = self._current
         if track is None:
@@ -203,9 +209,9 @@ class WavePlayer:
                 self._liked_ids.discard(track.id)
             else:
                 self._liked_ids.add(track.id)
+            snapshot = set(self._liked_ids)
 
-        action = self.client.unlike if was_liked else self.client.like
-        threading.Thread(target=self._safe_call, args=(action, track.id), daemon=True).start()
+        threading.Thread(target=save_local_likes, args=(snapshot,), daemon=True).start()
         return not was_liked
 
     def is_current_liked(self) -> bool:
@@ -240,14 +246,13 @@ class WavePlayer:
         if was_blocked:
             return False
 
-        # Лайк и блокировка взаимоисключающи — как в официальном клиенте с лайком.
+        # Лайк и блокировка взаимоисключающи — снимаем локальный ❤, если был.
         with self._lock:
             was_liked = track.id in self._liked_ids
             self._liked_ids.discard(track.id)
+            likes_snapshot = set(self._liked_ids)
         if was_liked:
-            threading.Thread(
-                target=self._safe_call, args=(self.client.unlike, track.id), daemon=True
-            ).start()
+            threading.Thread(target=save_local_likes, args=(likes_snapshot,), daemon=True).start()
 
         def apply() -> None:
             self._drop_from_queue(track.id)
@@ -284,26 +289,25 @@ class WavePlayer:
 
     # ---- internals ------------------------------------------------------
 
-    def _load_likes(self) -> None:
-        """Наполняет `_liked_ids` для toggle_like.
+    def _import_sc_likes_once(self) -> None:
+        """Разово подтягивает серверные лайки SoundCloud в локальные ❤.
 
-        Сначала мгновенно из локального кэша (likes_cache.json), потом
-        перекачка с сервера в фоне. Ревизии списка, как у Яндекса, у
-        SoundCloud нет — спросить «менялось ли» нечем, поэтому кэш нужен
-        ровно затем, чтобы ❤ в меню было верным сразу после старта.
+        Чтобы при первом запуске ❤ сразу отражал реальную библиотеку. Только
+        один раз (флаг `likes_imported`): дальше локальный список авторитетен —
+        снятый пользователем лайк не «воскресает» повторным импортом. Если сеть
+        упала, флаг не ставится и импорт повторится на следующем старте.
         """
-        cache = get_likes_cache()
-        with self._lock:
-            self._liked_ids.update(str(i) for i in cache.get("ids", []))
-
+        if get_likes_imported():
+            return
         ids = self._safe_call(self.client.liked_track_ids)
         if ids is None:
-            return  # сеть упала — живём на кэше
+            return
         with self._lock:
-            self._liked_ids.clear()
             self._liked_ids.update(ids)
-        save_likes_cache({"ids": list(ids), "fetched_at": time.time()})
-        logger.info("Fetched likes: %d tracks", len(ids))
+            snapshot = set(self._liked_ids)
+        save_local_likes(snapshot)
+        set_likes_imported()
+        logger.info("Импортировано %d лайков SoundCloud в локальные ❤", len(ids))
 
     def _safe_call(self, func, *args, **kwargs):
         try:
@@ -482,26 +486,15 @@ class WavePlayer:
         take, self._selection_pool = self._selection_pool[:count], self._selection_pool[count:]
         return take
 
-    def _take_likes(self, count: int) -> List[Track]:
-        """Немного случайных лайков прямо в пул добора — гарантированная
-        инъекция разнообразия рядом с моно-артистным `related`. Крутится по
-        кэшу лайков по кругу (лайки не «расходуются»: их приятно встречать в
-        волне не по разу)."""
-        with self._lock:
-            pool = self._like_pool
-        if not pool:
-            return []
-        return random.sample(pool, min(count, len(pool)))
-
     def _fetch_more(self) -> None:
         """Дозаправляет очередь разнообразным пулом.
 
-        Пул собирается из трёх источников с разной шириной вкуса: `related`
-        нескольких сидов (недавнее + случайные лайки), персональные подборки и
-        прямая подмешка лайков. Всё перемешивается и кладётся через `_enqueue`
-        со строгим оконным лимитом на артиста; если строгим не влезло ничего
-        (вся лента — один артист), повторяем без оконного лимита, чтобы волна
-        не встала.
+        Пул — `related` нескольких сидов (недавнее + случайные лайки как СЕМЕНА)
+        плюс персональные подборки; всё перемешивается и кладётся через
+        `_enqueue` со строгим оконным лимитом на артиста. Сами лайкнутые треки в
+        пул НЕ идут (лайки только сеют похожее — иначе волна переигрывает
+        знакомое). Если строгим фильтром не влезло ничего (вся лента — один
+        артист), повторяем без оконного лимита, чтобы волна не встала.
         """
         self._ensure_like_pool()
 
@@ -512,7 +505,6 @@ class WavePlayer:
                 pool.extend(related)
 
         pool.extend(self._take_selections(SELECTION_MIX))
-        pool.extend(self._take_likes(LIKE_MIX))
 
         if pool:
             random.shuffle(pool)

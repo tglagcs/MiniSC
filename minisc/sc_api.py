@@ -194,6 +194,7 @@ class SoundCloudClient:
         method: str,
         url: str,
         params: Optional[dict] = None,
+        json: Optional[dict] = None,
         authed: bool = True,
         expect_json: bool = True,
     ) -> Any:
@@ -213,7 +214,8 @@ class SoundCloudClient:
             query["client_id"] = self._ensure_client_id(force=attempt == 1)
             try:
                 resp = self._session.request(
-                    method, url, params=query, headers=self._headers(authed), timeout=TIMEOUT
+                    method, url, params=query, json=json,
+                    headers=self._headers(authed), timeout=TIMEOUT
                 )
             except requests.RequestException as exc:
                 raise SoundCloudError(f"{method} {url}: {exc}") from exc
@@ -372,34 +374,36 @@ class SoundCloudClient:
                 tracks.append(track)
         return tracks
 
-    # ---- лайки ----------------------------------------------------------
-
     def liked_track_ids(self) -> List[str]:
-        """Только id лайкнутого — отдельный лёгкий эндпоинт самого веб-плеера
-        (`me/track_likes/ids`), полные объекты треков для галочки ❤ не нужны."""
+        """Только id лайкнутого (лёгкий GET `me/track_likes/ids` веб-плеера).
+
+        Нужен для разового импорта серверных лайков в локальные ❤ при первом
+        запуске (`wave._import_sc_likes_once`). GET проходит — под DataDome
+        закрыты только write-действия (см. ниже)."""
         data = self._get("me/track_likes/ids", params={"limit": 200})
         return [str(i) for i in (data or {}).get("collection") or []]
 
-    def like(self, track_id: str) -> None:
-        self.request(
-            "PUT", f"users/{self.user_id}/track_likes/{track_id}", expect_json=False
-        )
-
-    def unlike(self, track_id: str) -> None:
-        self.request(
-            "DELETE", f"users/{self.user_id}/track_likes/{track_id}", expect_json=False
-        )
+    # Лайкнуть/разлайкнуть на сервере SoundCloud нельзя: write-эндпоинт лайков
+    # закрыт антиботом DataDome (PUT/DELETE `users/:id/track_likes/:id` отдают 403
+    # с капчей при любых заголовках/куках/TLS-отпечатке — проверено). Поэтому ❤ в
+    # MiniSC локальный (см. wave.toggle_like / config.local_likes). Лайки как
+    # сигнал для волны берутся read-only через `liked_tracks`/`liked_track_ids`.
 
     # ---- прослушивания --------------------------------------------------
 
     def report_play(self, track: Track) -> None:
-        """Пишет трек в историю прослушиваний — на этом SoundCloud и строит
-        персональные рекомендации. Аналог фидбека ротору у Яндекса."""
+        """Пишет трек в историю прослушиваний — она видна в профиле SoundCloud и
+        на ней строятся персональные рекомендации. Аналог фидбека ротору у Яндекса.
+
+        Проверено вживую: эндпоинт ждёт `track_urn` в JSON-ТЕЛЕ, а не в query
+        (query отдаёт 400, тело — 204). В отличие от лайков, `me/play-history`
+        не закрыт антиботом DataDome и проходит обычным запросом.
+        """
         try:
             self.request(
                 "POST",
                 "me/play-history",
-                params={"track_urn": track.urn},
+                json={"track_urn": track.urn},
                 expect_json=False,
             )
         except SoundCloudError as exc:
